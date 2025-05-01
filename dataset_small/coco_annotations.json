@@ -1,0 +1,85 @@
+{
+  "info": {
+    "description": "RF internal passport MRZ dataset",
+    "version": "1.0",
+    "year": 2025,
+    "contributor": "dolbaquaki",
+    "date_created": "2025-05-01"
+  },
+  "licenses": [
+    {
+      "id": 1,
+      "name": "CC-BY-4.0",
+      "url": "https://creativecommons.org/licenses/by/4.0/"
+    }
+  ],
+  "images": [
+    {
+      "id": 1,
+      "file_name": "passport_000000.png",
+      "width": 572,
+      "height": 731
+    },
+    {
+      "id": 2,
+      "file_name": "passport_000001.png",
+      "width": 572,
+      "height": 731
+    },
+    {
+      "id": 3,
+      "file_name": "passport_000002.png",
+      "width": 572,
+      "height": 731
+    },
+    {
+      "id": 4,
+      "file_name": "passport_000003.png",
+      "width": 572,
+      "height": 731
+    },
+    {
+      "id": 5,
+      "file_name": "passport_000004.png",
+      "width": 572,
+      "height": 731
+    }
+  ],
+  "annotations": [
+    {
+      "id": 1,
+      "image_id": 1,
+      "category_id": 1,
+      "bbox": [
+        57,
+        650,
+        520,
+        698
+      ],
+      "area": 22224,
+      "iscrowd": 0,
+      "segmentation": []
+    },
+    {
+      "id": 5,
+      "image_id": 5,
+      "category_id": 1,
+      "bbox": [
+        25,
+        650,
+        489,
+        698
+      ],
+      "area": 22272,
+      "iscrowd": 0,
+      "segmentation": []
+    }
+  ],
+  "categories": [
+    {
+      "id": 1,
+      "name": "mrz",
+      "supercategory": "passport"
+    }
+  ]
+}
