@@ -1,14 +1,23 @@
-import json, os, random, time, datetime
+# requirements:
+# pip install torch torchvision torchmetrics torchinfo tensorboard
+
+import json
+import os
+import random
+import datetime
+
 import torch
 import torchvision
-from PIL.ImageFile import ImageFile
-from torchvision.models.detection.faster_rcnn import FasterRCNN
-from torchvision.models.detection.faster_rcnn import fasterrcnn_resnet50_fpn_v2
-from torchvision.transforms import functional as F
-from torchmetrics.detection.mean_ap import MeanAveragePrecision
-from torch.utils.data import Dataset, DataLoader
-from PIL import Image, ImageEnhance, ImageFilter
 import numpy as np
+
+from PIL import Image, ImageFilter
+from torchvision.transforms import functional as F
+from torch.utils.data import Dataset, DataLoader
+from tensorboardX import SummaryWriter
+from torchinfo import summary
+from torchmetrics.detection.mean_ap import MeanAveragePrecision
+from torchvision.models.detection.faster_rcnn import fasterrcnn_resnet50_fpn_v2
+from torchvision.models.detection.faster_rcnn import FastRCNNPredictor
 
 # ----  Dataset  --------------------------------------------------------------
 class PassportMRZDataset(Dataset):
@@ -17,7 +26,6 @@ class PassportMRZDataset(Dataset):
         self.transforms = transforms
         with open(ann_path) as f:
             coco = json.load(f)
-        # COCO helpers ---------------------------------------------------------
         self.imgs = {img["id"]: img for img in coco["images"]}
         self.anns = {}
         for ann in coco["annotations"]:
@@ -34,13 +42,13 @@ class PassportMRZDataset(Dataset):
         for ann in self.anns.get(img_id, []):
             x, y, w, h = ann["bbox"]
             boxes.append([x, y, x + w, y + h])
-            labels.append(1)  # единственный класс: MRZ
+            labels.append(1)
 
         if len(boxes) == 0:
-            return self.__getitem__((idx + 1) % len(self))  # просто берем следующее
+            return self.__getitem__((idx + 1) % len(self))
 
         target = {
-            "boxes": torch.as_tensor(boxes, dtype=torch.float32).reshape(-1, 4),
+            "boxes": torch.as_tensor(boxes, dtype=torch.float32),
             "labels": torch.tensor(labels, dtype=torch.int64),
             "image_id": torch.tensor([img_id]),
         }
@@ -52,203 +60,179 @@ class PassportMRZDataset(Dataset):
     def __len__(self):
         return len(self.ids)
 
+class ToTensorOnly:
+    def __call__(self, img, target):
+        img = F.to_tensor(img)
+        return img, target
+
 # ----  Аугментации  ----------------------------------------------------------
 class ComposeTransforms:
     def __call__(self, img, target):
-        # Случайный горизонтальный флип
+        # случайный горизонтальный флип
         if random.random() < 0.5:
             img = F.hflip(img)
             w = img.width
-            boxes = target["boxes"]
-            boxes = boxes.clone()
+            boxes = target["boxes"].clone()
             boxes[:, [0, 2]] = w - boxes[:, [2, 0]]
             target["boxes"] = boxes
 
-        # # Случайный поворот в пределах -30 до 30 градусов
-        # angle = random.uniform(-30, 30)
-        # img = F.rotate(img, angle)
-        # boxes = target["boxes"]
-        # boxes = boxes.clone()
-        # boxes = self.rotate_boxes(boxes, angle, img.width, img.height)
-        # target["boxes"] = boxes
-
-        # Добавление случайного шума (не сильного)
+        # добавить шум
         img = self.add_random_noise(img)
-
-        # Добавление случайных бликов
+        # добавить блик
         img = self.add_random_glare(img)
-
-        # Легкое добавление потертости (по желанию)
+        # легкая потертость
         img = self.add_worn_effect(img)
 
-        img = F.to_tensor(img)  # Преобразуем в тензор
+        img = F.to_tensor(img)
         return img, target
 
-    def rotate_boxes(self, boxes, angle, width, height):
-        """Корректируем координаты боксов для поворота"""
-        angle_rad = np.deg2rad(angle)
-        cos_theta = np.cos(angle_rad)
-        sin_theta = np.sin(angle_rad)
-
-        new_boxes = []
-        for box in boxes:
-            x_min, y_min, x_max, y_max = box
-            center_x = (x_min + x_max) / 2
-            center_y = (y_min + y_max) / 2
-            new_x_min = cos_theta * (x_min - center_x) - sin_theta * (y_min - center_y) + center_x
-            new_y_min = sin_theta * (x_min - center_x) + cos_theta * (y_min - center_y) + center_y
-            new_x_max = cos_theta * (x_max - center_x) - sin_theta * (y_max - center_y) + center_x
-            new_y_max = sin_theta * (x_max - center_x) + cos_theta * (y_max - center_y) + center_y
-            new_boxes.append([new_x_min, new_y_min, new_x_max, new_y_max])
-
-        return torch.tensor(new_boxes, dtype=torch.float32)
-
     def add_random_noise(self, img):
-        """Добавление случайного шума на изображение"""
         np_img = np.array(img)
-        noise = np.random.normal(0, 5, np_img.shape)  # Небольшой шум
-        noisy_img = np_img + noise
-        noisy_img = np.clip(noisy_img, 0, 255).astype(np.uint8)
-        return Image.fromarray(noisy_img)
+        noise = np.random.normal(0, 5, np_img.shape)
+        noisy = np.clip(np_img + noise, 0, 255).astype(np.uint8)
+        return Image.fromarray(noisy)
 
     def add_random_glare(self, img):
-        """Добавление случайного блика на изображение"""
-        width, height = img.size
-        img_copy = img.copy()
-
-        # Создаем пустое изображение для блика
-        glare = Image.new('RGBA', (width, height), (0, 0, 0, 0))
-
-        # Задаем случайные размеры и положение блика
-        glare_width = random.randint(50, 200)
-        glare_height = random.randint(50, 200)
-        glare_position = (random.randint(0, width - glare_width), random.randint(0, height - glare_height))
-
-        # Генерация случайной прозрачности для блика
-        opacity = random.randint(30, 100)  # Прозрачность блика (0-255)
-        glare.paste((255, 255, 255, opacity), (0, 0, glare_width, glare_height))  # Размещение блика
-
-        # Наложение блика на оригинальное изображение
-        img_copy.paste(glare, glare_position, mask=glare)
-
-        return img_copy
+        w, h = img.size
+        glare = Image.new('RGBA', (w, h), (0, 0, 0, 0))
+        gw, gh = random.randint(50,200), random.randint(50,200)
+        pos = (random.randint(0, w-gw), random.randint(0, h-gh))
+        opacity = random.randint(30,100)
+        block = Image.new('RGBA', (gw, gh), (255,255,255,opacity))
+        glare.paste(block, pos, block)
+        out = img.copy()
+        out.paste(glare, mask=glare)
+        return out.convert("RGB")
 
     def add_worn_effect(self, img):
-        """Добавление легкой потертости (к примеру, через размытие)"""
-        if random.random() < 0.3:  # Редко, но бывает
-            img = img.filter(ImageFilter.GaussianBlur(radius=random.uniform(0.5, 1.5)))  # Легкое размытие
+        if random.random() < 0.3:
+            return img.filter(ImageFilter.GaussianBlur(radius=random.uniform(0.5,1.5)))
         return img
 
 
 # ----  Модель  ---------------------------------------------------------------
-def get_model(num_classes=2):
+def get_model(num_classes=2, input_size=(3,800,800)):
     model = fasterrcnn_resnet50_fpn_v2(weights="DEFAULT")
-    in_features = model.roi_heads.box_predictor.cls_score.in_features
-    model.roi_heads.box_predictor = \
-        torchvision.models.detection.faster_rcnn.FastRCNNPredictor(
-            in_features, num_classes
-        )
+    in_feats = model.roi_heads.box_predictor.cls_score.in_features
+    model.roi_heads.box_predictor = FastRCNNPredictor(in_feats, num_classes)
+
+    # печать структуры и подсчёт параметров
+    print("\n=== Model Summary ===")
+    summary(model, input_size=[(1, *input_size)],
+            col_names=["input_size", "output_size", "num_params", "trainable"])
+    total = sum(p.numel() for p in model.parameters())
+    trainable = sum(p.numel() for p in model.parameters() if p.requires_grad)
+    print(f"Total params: {total:,}, Trainable params: {trainable:,}\n")
+
     return model
 
+
 # ----  Обучение  -------------------------------------------------------------
-def train_one_epoch(model, optimizer, loader, device, epoch, print_freq=50):
+def train_one_epoch(model, optimizer, loader, device, epoch, writer=None, print_freq=50):
     model.train()
-    epoch_loss = 0
+    epoch_loss = 0.0
     for i, (imgs, targets) in enumerate(loader):
         imgs = [img.to(device) for img in imgs]
         targets = [{k: v.to(device) for k, v in t.items()} for t in targets]
+
         loss_dict = model(imgs, targets)
-        losses = sum(loss_dict.values())
+        loss = sum(loss_dict.values())
         optimizer.zero_grad()
-        losses.backward()
+        loss.backward()
         optimizer.step()
-        epoch_loss += losses.item()
+        epoch_loss += loss.item()
+
+        step = epoch * len(loader) + i
+        if writer:
+            writer.add_scalar("Loss/train", loss.item(), step)
+            writer.add_scalar("LR", optimizer.param_groups[0]["lr"], step)
+
         if i % print_freq == 0:
-            print(f"Epoch {epoch}, step {i}, loss {losses.item():.4f}")
+            print(f"Epoch {epoch}, step {i}, loss {loss.item():.4f}")
+
     return epoch_loss / len(loader)
 
-def save_checkpoint(model, path):
-    torch.save(model.state_dict(), path)
 
-def evaluate_map(model, loader, device):
-    metric = MeanAveragePrecision(
-        box_format="xyxy",     # у нас именно xmin, ymin, xmax, ymax
-        iou_type="bbox",       # для детекции
-        iou_thresholds=None,   # по умолчанию 0.5:0.95 шаг 0.05
-        backend="pycocotools"  # быстрый и точный расчёт
-    )
-
+def evaluate_map(model, loader, device, epoch=None, writer=None):
+    metric = MeanAveragePrecision(box_format="xyxy", iou_type="bbox", backend="pycocotools")
     model.eval()
     with torch.no_grad():
         for imgs, targets in loader:
             imgs = [img.to(device) for img in imgs]
-            outputs = model(imgs)           # ← список словарей
-
-            # Перегоняем всё на CPU и в expected-формат
-            preds  = []
-            gts    = []
+            outputs = model(imgs)
+            preds, gts = [], []
             for out, tgt in zip(outputs, targets):
                 preds.append({
-                    "boxes" : out["boxes"].cpu(),
+                    "boxes": out["boxes"].cpu(),
                     "scores": out["scores"].cpu(),
                     "labels": out["labels"].cpu()
                 })
                 gts.append({
-                    "boxes" : tgt["boxes"].cpu(),
+                    "boxes": tgt["boxes"].cpu(),
                     "labels": tgt["labels"].cpu()
                 })
-
             metric.update(preds, gts)
 
-    return metric.compute()
+    stats = metric.compute()
+    m50 = stats["map_50"].item()
+    ma = stats["map"].item()
+    print(f"Validation mAP@0.5: {m50:.4f}, mAP@[.5:.95]: {ma:.4f}")
+
+    if writer and epoch is not None:
+        writer.add_scalar("mAP/0.5", m50, epoch)
+        writer.add_scalar("mAP/0.5:0.95", ma, epoch)
+
+    return stats
+
 
 # ----  main  -----------------------------------------------------------------
 def main():
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    print(device)
+
+    writer = SummaryWriter(log_dir="runs/fasterrcnn_experiment")
 
     train_set = PassportMRZDataset(
-        "./dataset_small/images",
-        "./dataset_small/coco_annotations.json",
-        transforms=ComposeTransforms())
-
+        "../dataset_small/images",
+        "../dataset_small/coco_annotations.json",
+        transforms=ToTensorOnly()
+    )
     val_set = PassportMRZDataset(
         "../dataset_small/images",
         "../dataset_small/coco_annotations.json",
-        transforms=ComposeTransforms())  # можешь отключить аугм. для вал.
+        transforms=ComposeTransforms()
+    )
 
-    train_loader = DataLoader(
-        train_set, batch_size=4, shuffle=True,
-        collate_fn=lambda x: tuple(zip(*x)))
-
-    val_loader = DataLoader(
-        val_set, batch_size=2, shuffle=False,
-        collate_fn=lambda x: tuple(zip(*x)))
+    train_loader = DataLoader(train_set, batch_size=4, shuffle=True, collate_fn=lambda x: tuple(zip(*x)))
+    val_loader   = DataLoader(val_set,   batch_size=2, shuffle=False, collate_fn=lambda x: tuple(zip(*x)))
 
     model = get_model()
     model.to(device)
 
+    # если хотите залогировать граф:
+    # dummy = torch.zeros((1,3,800,800), device=device)
+    # writer.add_graph(model, dummy)
+
     optimizer = torch.optim.AdamW(
         [p for p in model.parameters() if p.requires_grad],
-        lr=1e-4, weight_decay=1e-4)
+        lr=1e-4, weight_decay=1e-4
+    )
 
     best_map50 = 0.0
-    for epoch in range(1, 21):  # или сколько хочешь эпох
-        print(f"\nEpoch {epoch}")
-        train_loss = train_one_epoch(model, optimizer, train_loader, device, epoch)
+    for epoch in range(1, 21):
+        print(f"\n=== Epoch {epoch} ===")
+        train_loss = train_one_epoch(model, optimizer, train_loader, device, epoch, writer)
         print(f"Train loss: {train_loss:.4f}")
 
-        # Оценка по mAP
-        stats = evaluate_map(model, val_loader, device)
-        map50 = stats["map_50"].item()
-        map_all = stats["map"].item()
-        print(f"Validation mAP@0.5: {map50:.4f}, mAP@[.5:.95]: {map_all:.4f}")
+        stats = evaluate_map(model, val_loader, device, epoch, writer)
+        m50 = stats["map_50"].item()
+        if m50 > best_map50:
+            best_map50 = m50
+            ckpt = f"mrz_best_map50_{datetime.datetime.now().strftime('%Y%m%d_%H%M')}.pt"
+            torch.save(model.state_dict(), ckpt)
+            print(f"** Saved new best model to {ckpt} **")
 
-        if map50 > best_map50:
-            best_map50 = map50
-            ckpt_name = f"mrz_best_map50_{datetime.datetime.now().strftime('%Y%m%d_%H%M')}.pt"
-            save_checkpoint(model, ckpt_name)
-            print(f"** Saved new best model to {ckpt_name} **")
+    writer.close()
+
 
 if __name__ == "__main__":
     main()
