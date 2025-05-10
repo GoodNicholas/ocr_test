@@ -205,10 +205,11 @@ def evaluate_map(model, loader, device):
 # ----  main  -----------------------------------------------------------------
 def main():
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    print(device)
 
     train_set = PassportMRZDataset(
-        "../dataset_small/images",
-        "../dataset_small/coco_annotations.json",
+        "./dataset_small/images",
+        "./dataset_small/coco_annotations.json",
         transforms=ComposeTransforms())
 
     val_set = PassportMRZDataset(
