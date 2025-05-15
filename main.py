@@ -134,16 +134,55 @@ def trim_whitespace(im: Image.Image) -> Image.Image:
     bbox = diff.getbbox()
     return im.crop(bbox) if bbox else im
 
-def save_yolo_txt(path: Path, items: list, img_size: tuple):
+def clamp_bbox(bb, W, H):
+    x1,y1,x2,y2 = bb
+    x1, y1 = max(0, x1),     max(0, y1)
+    x2, y2 = min(W, x2), min(H, y2)
+    return [x1, y1, x2, y2]
+
+
+def save_yolo_txt(path, items, img_size):
     W, H = img_size
     lines = []
     for cls_id, (x1, y1, x2, y2) in items:
-        xc = ((x1 + x2) / 2) / W
-        yc = ((y1 + y2) / 2) / H
+
+        x1, y1 = max(0, x1),      max(0, y1)
+        x2, y2 = min(W, x2), min(H, y2)
+
+        if x2 <= x1 or y2 <= y1:
+            continue
+
+        xc = ((x1 + x2) * 0.5) / W
+        yc = ((y1 + y2) * 0.5) / H
         w  = (x2 - x1) / W
         h  = (y2 - y1) / H
+
+        if not (0 <= xc <= 1 and 0 <= yc <= 1 and 0 < w <= 1 and 0 < h <= 1):
+            continue
         lines.append(f"{cls_id} {xc:.6f} {yc:.6f} {w:.6f} {h:.6f}")
     path.write_text("\n".join(lines))
+
+def prepare_stage2_items(annots, passport_bbox, crop_size, field_classes):
+    px1, py1, px2, py2 = passport_bbox
+    pw, ph = crop_size
+    items = []
+    for a in annots:
+        label = a["label"]
+        if label not in field_classes:
+            continue
+        cls = field_classes[label]
+        fx1, fy1, fx2, fy2 = a["bbox"]
+        # смещение относительно выреза
+        rx1, ry1 = fx1 - px1, fy1 - py1
+        rx2, ry2 = fx2 - px1, fy2 - py1
+        # клэмпим по границам вырезанного паспорта
+        rx1, ry1 = max(0, rx1), max(0, ry1)
+        rx2, ry2 = min(pw, rx2), min(ph, ry2)
+        # пропускаем некорректные
+        if rx2 <= rx1 or ry2 <= ry1:
+            continue
+        items.append((cls, (rx1, ry1, rx2, ry2)))
+    return items
 
 def wrap_text(text, font, max_width, max_lines=3):
     words, lines, line = text.split(), [], ""
@@ -468,64 +507,85 @@ def main():
         d.mkdir(parents=True, exist_ok=True)
 
     # 2) Инициализация генератора
-    gen = PassportGenerator()  # из вашего кода
+    gen = PassportGenerator()
     ds = []
     coco_data = {
-        "info": {...},  # ваша структура
-        "licenses": [...],
+        "info": {
+            "description": "RF internal passport MRZ dataset",
+            "version": "1.0",
+            "year": 2025,
+            "contributor": "dolbaquaki",
+            "date_created": "2025-05-01"
+        },
+        "licenses": [
+            {
+                "id": 1,
+                "name": "CC-BY-4.0",
+                "url": "https://creativecommons.org/licenses/by/4.0/"
+            }
+        ],
         "images": [],
         "annotations": [],
-        "categories": [{"id":1,"name":"mrz","supercategory":"passport"}]
+        "categories": [
+            {
+                "id": 1,
+                "name": "mrz",
+                "supercategory": "passport"
+            }
+        ]
     }
 
     # 3) Генерация
     for i in range(N_PASSPORTS):
         include_mrz = random.choice([True, False])
         fn, ann, annots, pbbox = gen.generate_one(
-            i, offset=None, photo_box=COORDS["photo_box"],
-            include_mrz=include_mrz, debug=DEBUG
+            i,
+            offset=None,
+            photo_box=COORDS["photo_box"],
+            include_mrz=include_mrz,
+            debug=DEBUG
         )
 
         img = Image.open(OUT_IMG_DIR / fn)
-        width, height = img.size
+        W, H = img.size
         is_train = random.random() < 0.8
 
-        # a) Сохраняем оригинальные аннотации
+        # a) Сохраняем оригинальные JSON-аннотации
         ds.append({
             "image_id": fn,
-            "mrz": ann['mrz'],
-            "photo": ann['photo'],
-            "text": ann['text']
+            "mrz": ann["mrz"],
+            "photo": ann["photo"],
+            "text": ann["text"]
         })
         coco_data["images"].append({
             "id": i+1,
             "file_name": fn,
-            "width": width,
-            "height": height
+            "width": W,
+            "height": H
         })
-        if ann['mrz']['exists']:
+        if ann["mrz"]["exists"]:
             coco_data["annotations"].append({
                 "id": i+1,
                 "image_id": i+1,
                 "category_id": 1,
-                "bbox": ann['mrz']['coordinates'],
-                "area": (ann['mrz']['coordinates'][2] - ann['mrz']['coordinates'][0]) *
-                        (ann['mrz']['coordinates'][3] - ann['mrz']['coordinates'][1]),
+                "bbox": ann["mrz"]["coordinates"],
+                "area": (ann["mrz"]["coordinates"][2] - ann["mrz"]["coordinates"][0]) *
+                        (ann["mrz"]["coordinates"][3] - ann["mrz"]["coordinates"][1]),
                 "iscrowd": 0,
                 "segmentation": []
             })
 
-        # b) Stage1: полный паспорт для YOLO
+        # b) Stage1 YOLO: полный паспорт
         scan_dir = ST1_IMG_T if is_train else ST1_IMG_V
         lbl_dir  = ST1_LBL_T if is_train else ST1_LBL_V
         shutil.copy(OUT_IMG_DIR / fn, scan_dir / fn)
         save_yolo_txt(
             lbl_dir / f"{fn[:-4]}.txt",
             [(0, tuple(pbbox))],
-            (width, height)
+            (W, H)
         )
 
-        # c) Stage2: поля внутри паспорта для YOLO
+        # c) Stage2 YOLO: поля внутри паспорта
         x1, y1, x2, y2 = pbbox
         crop = img.crop((x1, y1, x2, y2))
         pw, ph = crop.size
@@ -541,7 +601,11 @@ def main():
             rx1, ry1 = fx1 - x1, fy1 - y1
             rx2, ry2 = fx2 - x1, fy2 - y1
             items.append((cls, (rx1, ry1, rx2, ry2)))
-        save_yolo_txt(crop_lbl / f"{crop_fn[:-4]}.txt", items, (pw, ph))
+        save_yolo_txt(
+            crop_lbl / f"{crop_fn[:-4]}.txt",
+            items,
+            (pw, ph)
+        )
 
     # 4) Сохранение JSON
     with open(ANNOT_PATH, 'w', encoding='utf-8') as f:
@@ -552,8 +616,6 @@ def main():
     print(f"✅ {N_PASSPORTS} passports -> {OUT_IMG_DIR}")
     print(f"✅ COCO annotations saved to {COCO_ANNOT_PATH}")
     print(f"✅ YOLO datasets ready under {YOLO_ROOT}")
-
-
 
 if __name__ == '__main__':
     main()
