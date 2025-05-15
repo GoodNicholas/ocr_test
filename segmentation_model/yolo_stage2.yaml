@@ -1,5 +1,5 @@
-train: /content/ocr_test/ocr_test/dataset_yolo/stage2/images/train
-val:   /content/ocr_test/ocr_test/dataset_yolo/stage2/images/val
+train: /content/ocr_test/dataset_yolo/stage2/images/train
+val:   /content/ocr_test/dataset_yolo/stage2/images/val
 
 # number of classes (field types)
 nc: 11
