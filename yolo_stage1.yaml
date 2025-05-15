@@ -1,0 +1,6 @@
+train: /home/nicholas/PycharmProjects/Passport_generator/dataset_yolo/stage1/images/train
+val:   /home/nicholas/PycharmProjects/Passport_generator/dataset_yolo/stage1/images/val
+
+nc: 1
+names:
+  0: passport
