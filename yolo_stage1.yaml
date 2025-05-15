@@ -1,5 +1,5 @@
-train: /home/nicholas/PycharmProjects/Passport_generator/dataset_yolo/stage1/images/train
-val:   /home/nicholas/PycharmProjects/Passport_generator/dataset_yolo/stage1/images/val
+train: /content/ocr_test/ocr_test/dataset_yolo/stage1/images/train
+val:   /content/ocr_test/ocr_test/dataset_yolo/stage1/images/val
 
 nc: 1
 names:
