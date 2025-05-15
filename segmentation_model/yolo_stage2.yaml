@@ -1,0 +1,19 @@
+train: /path/to/dataset_yolo/stage2/images/train
+val:   /path/to/dataset_yolo/stage2/images/val
+
+# number of classes (field types)
+nc: 11
+
+# field class names must match your FIELD_CLASSES mapping
+names:
+  0: surname
+  1: name
+  2: patronymic
+  3: gender
+  4: dob
+  5: birth_place
+  6: issuing_auth
+  7: issue_date
+  8: division_code
+  9: series_number
+  10: mrz
