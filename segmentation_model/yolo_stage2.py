@@ -1,13 +1,13 @@
 from ultralytics import YOLO
 
-model = YOLO("yolov11x.pt")
+model = YOLO("yolo11x.pt")
 
 results = model.train(
-    data="/home/nicholas/PycharmProjects/Passport_generator/segmentation_model/yolo_stage1.yaml",
+    data="/content/ocr_test/segmentation_model/yolo_stage2.yaml",
     epochs=100,
     imgsz=640,
     batch=14,
-    device="cpu"
+    device="cuda"
 )
 
 predictions = model("path/to/test_image.jpg")
