@@ -496,18 +496,86 @@ class PassportGenerator:
         passport_bbox = [dx, dy, dx + img.width, dy + img.height]
         return fname, annotation, annots, passport_bbox
 
+def generate_passport(idx, gen, debug=False):
+    # Генерация изображения паспорта и аннотаций
+    include_mrz = random.choice([True, False])
+    fn, ann, annots, pbbox = gen.generate_one(
+        idx,
+        offset=None,
+        photo_box=COORDS["photo_box"],
+        include_mrz=include_mrz,
+        debug=debug
+    )
+    return fn, ann, annots, pbbox
+
+def save_passport_data(fn, ann, annots, pbbox):
+    img = Image.open(OUT_IMG_DIR / fn)
+    W, H = img.size
+    is_train = random.random() < 0.8
+
+    # a) Сохраняем аннотации
+    ds.append({
+        "image_id": fn,
+        "mrz": ann["mrz"],
+        "photo": ann["photo"],
+        "text": ann["text"]
+    })
+    coco_data["images"].append({
+        "id": len(coco_data["images"]) + 1,
+        "file_name": fn,
+        "width": W,
+        "height": H
+    })
+    if ann["mrz"]["exists"]:
+        coco_data["annotations"].append({
+            "id": len(coco_data["annotations"]) + 1,
+            "image_id": len(coco_data["images"]),
+            "category_id": 1,
+            "bbox": ann["mrz"]["coordinates"],
+            "area": (ann["mrz"]["coordinates"][2] - ann["mrz"]["coordinates"][0]) *
+                    (ann["mrz"]["coordinates"][3] - ann["mrz"]["coordinates"][1]),
+            "iscrowd": 0,
+            "segmentation": []
+        })
+
+    # b) Stage1 YOLO: сохраняем полный паспорт
+    scan_dir = ST1_IMG_T if is_train else ST1_IMG_V
+    lbl_dir  = ST1_LBL_T if is_train else ST1_LBL_V
+    shutil.copy(OUT_IMG_DIR / fn, scan_dir / fn)
+    save_yolo_txt(
+        lbl_dir / f"{fn[:-4]}.txt",
+        [(0, tuple(pbbox))],
+        (W, H)
+    )
+
+    # c) Stage2 YOLO: сохраняем обрезанные части паспорта
+    x1, y1, x2, y2 = pbbox
+    crop = img.crop((x1, y1, x2, y2))
+    pw, ph = crop.size
+    crop_fn = f"passport_{len(ds):06d}.png"
+    crop_dir = ST2_IMG_T if is_train else ST2_IMG_V
+    crop_lbl = ST2_LBL_T if is_train else ST2_LBL_V
+    crop.save(crop_dir / crop_fn)
+
+    items = []
+    for a in annots:
+        cls = FIELD_CLASSES[a["label"]]
+        fx1, fy1, fx2, fy2 = a["bbox"]
+        rx1, ry1 = fx1 - x1, fy1 - y1
+        rx2, ry2 = fx2 - x1, fy2 - y1
+        items.append((cls, (rx1, ry1, rx2, ry2)))
+    save_yolo_txt(
+        crop_lbl / f"{crop_fn[:-4]}.txt",
+        items,
+        (pw, ph)
+    )
+
 
 # ----------------------------- MAIN ----------------------------------
 def main():
-    # 1) Подготовка каталогов
-    OUT_IMG_DIR.mkdir(parents=True, exist_ok=True)
-    OUT_DIR.mkdir(parents=True, exist_ok=True)
-    for d in (ST1_IMG_T, ST1_IMG_V, ST1_LBL_T, ST1_LBL_V,
-              ST2_IMG_T, ST2_IMG_V, ST2_LBL_T, ST2_LBL_V):
-        d.mkdir(parents=True, exist_ok=True)
-
-    # 2) Инициализация генератора
     gen = PassportGenerator()
+    
+    # Структуры данных
     ds = []
     coco_data = {
         "info": {
@@ -535,87 +603,23 @@ def main():
         ]
     }
 
-    # 3) Генерация
-    for i in range(N_PASSPORTS):
-        include_mrz = random.choice([True, False])
-        fn, ann, annots, pbbox = gen.generate_one(
-            i,
-            offset=None,
-            photo_box=COORDS["photo_box"],
-            include_mrz=include_mrz,
-            debug=DEBUG
-        )
+    OUT_IMG_DIR.mkdir(parents=True, exist_ok=True)
+    OUT_DIR.mkdir(parents=True, exist_ok=True)
+    for d in (ST1_IMG_T, ST1_IMG_V, ST1_LBL_T, ST1_LBL_V, ST2_IMG_T, ST2_IMG_V, ST2_LBL_T, ST2_LBL_V):
+        d.mkdir(parents=True, exist_ok=True)
 
-        img = Image.open(OUT_IMG_DIR / fn)
-        W, H = img.size
-        is_train = random.random() < 0.8
+    with concurrent.futures.ProcessPoolExecutor() as executor:
+        future_to_idx = {executor.submit(generate_passport, i, gen): i for i in range(N_PASSPORTS)}
+        for future in concurrent.futures.as_completed(future_to_idx):
+            fn, ann, annots, pbbox = future.result()
+            save_passport_data(fn, ann, annots, pbbox)
 
-        # a) Сохраняем оригинальные JSON-аннотации
-        ds.append({
-            "image_id": fn,
-            "mrz": ann["mrz"],
-            "photo": ann["photo"],
-            "text": ann["text"]
-        })
-        coco_data["images"].append({
-            "id": i+1,
-            "file_name": fn,
-            "width": W,
-            "height": H
-        })
-        if ann["mrz"]["exists"]:
-            coco_data["annotations"].append({
-                "id": i+1,
-                "image_id": i+1,
-                "category_id": 1,
-                "bbox": ann["mrz"]["coordinates"],
-                "area": (ann["mrz"]["coordinates"][2] - ann["mrz"]["coordinates"][0]) *
-                        (ann["mrz"]["coordinates"][3] - ann["mrz"]["coordinates"][1]),
-                "iscrowd": 0,
-                "segmentation": []
-            })
-
-        # b) Stage1 YOLO: полный паспорт
-        scan_dir = ST1_IMG_T if is_train else ST1_IMG_V
-        lbl_dir  = ST1_LBL_T if is_train else ST1_LBL_V
-        shutil.copy(OUT_IMG_DIR / fn, scan_dir / fn)
-        save_yolo_txt(
-            lbl_dir / f"{fn[:-4]}.txt",
-            [(0, tuple(pbbox))],
-            (W, H)
-        )
-
-        # c) Stage2 YOLO: поля внутри паспорта
-        x1, y1, x2, y2 = pbbox
-        crop = img.crop((x1, y1, x2, y2))
-        pw, ph = crop.size
-        crop_dir = ST2_IMG_T if is_train else ST2_IMG_V
-        crop_lbl = ST2_LBL_T if is_train else ST2_LBL_V
-        crop_fn  = f"passport_{i:06d}.png"
-        crop.save(crop_dir / crop_fn)
-
-        items = []
-        for a in annots:
-            cls = FIELD_CLASSES[a["label"]]
-            fx1, fy1, fx2, fy2 = a["bbox"]
-            rx1, ry1 = fx1 - x1, fy1 - y1
-            rx2, ry2 = fx2 - x1, fy2 - y1
-            items.append((cls, (rx1, ry1, rx2, ry2)))
-        save_yolo_txt(
-            crop_lbl / f"{crop_fn[:-4]}.txt",
-            items,
-            (pw, ph)
-        )
-
-    # 4) Сохранение JSON
     with open(ANNOT_PATH, 'w', encoding='utf-8') as f:
         json.dump(ds, f, ensure_ascii=False, indent=2)
     with open(COCO_ANNOT_PATH, 'w', encoding='utf-8') as f:
         json.dump(coco_data, f, ensure_ascii=False, indent=2)
 
-    print(f"✅ {N_PASSPORTS} passports -> {OUT_IMG_DIR}")
+    print(f"✅ {N_PASSPORTS} passports generated.")
     print(f"✅ COCO annotations saved to {COCO_ANNOT_PATH}")
     print(f"✅ YOLO datasets ready under {YOLO_ROOT}")
 
-if __name__ == '__main__':
-    main()
