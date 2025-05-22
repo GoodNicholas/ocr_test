@@ -1,4 +1,5 @@
 import os
+import shutil
 import random
 import json
 import string
@@ -21,11 +22,27 @@ DEBUG_IMG_DIR = OUT_DIR / "debug_images"
 ANNOT_PATH = OUT_DIR / "annotations.json"
 COCO_ANNOT_PATH = OUT_DIR / "coco_annotations.json"
 
+YOLO_ROOT = ROOT / "dataset_yolo"
+
+ST1_IMG_T = YOLO_ROOT / "stage1" / "images" / "train"
+ST1_IMG_V = YOLO_ROOT / "stage1" / "images" / "val"
+ST1_LBL_T = YOLO_ROOT / "stage1" / "labels" / "train"
+ST1_LBL_V = YOLO_ROOT / "stage1" / "labels" / "val"
+
+ST2_IMG_T = YOLO_ROOT / "stage2" / "images" / "train"
+ST2_IMG_V = YOLO_ROOT / "stage2" / "images" / "val"
+ST2_LBL_T = YOLO_ROOT / "stage2" / "labels" / "train"
+ST2_LBL_V = YOLO_ROOT / "stage2" / "labels" / "val"
+
+for d in (ST1_IMG_T,ST1_IMG_V,ST1_LBL_T,ST1_LBL_V,
+          ST2_IMG_T,ST2_IMG_V,ST2_LBL_T,ST2_LBL_V):
+    d.mkdir(parents=True, exist_ok=True)
+
 # Параметры
 MARGIN_X = 200
 MARGIN_Y = 100
 MRZ_FONT_SIZE = 18
-N_PASSPORTS = 100
+N_PASSPORTS = 1000
 SERIES_FONT_SIZE = 20
 GROUP_GAP = 25
 FONT_SIZE = 18
@@ -54,6 +71,16 @@ COORDS = {
 
     "photo_box": (26, 435, 170, 630)
 }
+
+FIELD_CLASSES = {
+    "surname":0, "name":1, "patronymic":2, "gender":3,
+    "dob":4, "birth_place":5, "issuing_auth":6,
+    "issue_date":7, "division_code":8,
+    "series_number_top":9, "series_number_bottom":9,
+    "mrz1":10, "mrz2":10
+}
+NC_STAGE1 = 1
+NC_STAGE2 = max(FIELD_CLASSES.values())+1
 
 # Инициализация
 issuing_authorities = [
@@ -107,6 +134,55 @@ def trim_whitespace(im: Image.Image) -> Image.Image:
     bbox = diff.getbbox()
     return im.crop(bbox) if bbox else im
 
+def clamp_bbox(bb, W, H):
+    x1,y1,x2,y2 = bb
+    x1, y1 = max(0, x1),     max(0, y1)
+    x2, y2 = min(W, x2), min(H, y2)
+    return [x1, y1, x2, y2]
+
+
+def save_yolo_txt(path, items, img_size):
+    W, H = img_size
+    lines = []
+    for cls_id, (x1, y1, x2, y2) in items:
+
+        x1, y1 = max(0, x1),      max(0, y1)
+        x2, y2 = min(W, x2), min(H, y2)
+
+        if x2 <= x1 or y2 <= y1:
+            continue
+
+        xc = ((x1 + x2) * 0.5) / W
+        yc = ((y1 + y2) * 0.5) / H
+        w  = (x2 - x1) / W
+        h  = (y2 - y1) / H
+
+        if not (0 <= xc <= 1 and 0 <= yc <= 1 and 0 < w <= 1 and 0 < h <= 1):
+            continue
+        lines.append(f"{cls_id} {xc:.6f} {yc:.6f} {w:.6f} {h:.6f}")
+    path.write_text("\n".join(lines))
+
+def prepare_stage2_items(annots, passport_bbox, crop_size, field_classes):
+    px1, py1, px2, py2 = passport_bbox
+    pw, ph = crop_size
+    items = []
+    for a in annots:
+        label = a["label"]
+        if label not in field_classes:
+            continue
+        cls = field_classes[label]
+        fx1, fy1, fx2, fy2 = a["bbox"]
+        # смещение относительно выреза
+        rx1, ry1 = fx1 - px1, fy1 - py1
+        rx2, ry2 = fx2 - px1, fy2 - py1
+        # клэмпим по границам вырезанного паспорта
+        rx1, ry1 = max(0, rx1), max(0, ry1)
+        rx2, ry2 = min(pw, rx2), min(ph, ry2)
+        # пропускаем некорректные
+        if rx2 <= rx1 or ry2 <= ry1:
+            continue
+        items.append((cls, (rx1, ry1, rx2, ry2)))
+    return items
 
 def wrap_text(text, font, max_width, max_lines=3):
     words, lines, line = text.split(), [], ""
@@ -162,41 +238,76 @@ def random_issuing_auth():
 
 def mrz_checksum(data: str) -> str:
     weights = [7, 3, 1]
-    char_values = {chr(i): i - 55 for i in range(65, 91)}  # A=10 ... Z=35
+    # A–Z → 10–35, 0–9 → 0–9, '<' → 0
+    char_values = {chr(i): i - 55 for i in range(65, 91)}
     char_values.update({str(i): i for i in range(10)})
     char_values['<'] = 0
 
     total = sum(char_values.get(c, 0) * weights[i % 3] for i, c in enumerate(data))
     return str(total % 10)
 
+# 2) основная функция
+def gen_mrz(data: dict):
+    """
+    data = {
+      'surname', 'given', 'patronymic',        # строки на кириллице
+      'series': '1234',                         # 4 цифры
+      'number': '123456',                       # 6 цифр
+      'dob': 'YYMMDD',                          # дата рождения
+      'expiry': 'YYMMDD',                       # срок действия
+      'issue': 'YYMMDD',                        # дата выдачи
+      'division_code': '123-456',               # код подразделения
+      'nationality': 'RUS',                     # 3 буквы
+      'gender': 'M' or 'F'
+    }
+    """
 
-def gen_mrz(data: dict) -> tuple[str, str]:
-    # 1-я строка
+    # 2.1) строим имя
     surname = transliterate_gost(data['surname']).replace(' ', '<')
-    given = transliterate_gost(data['given']).replace(' ', '<')
-    patronymic = transliterate_gost(data['patronymic']).replace(' ', '<')
-    name_field = f"{surname}<<{given}<{patronymic}".replace('<<', '<<')[:39]
-    line1 = f"PNRUS{name_field}".ljust(44, '<')
+    given   = transliterate_gost(data['given']).replace(' ', '<')
+    patron  = transliterate_gost(data['patronymic']).replace(' ', '<')
 
-    # 2-я строка
-    series = data['series'][:3]
-    last_digit = data['series'][3]
-    passport_number = data['number']
-    pd_field = series + passport_number
-    pd_check = mrz_checksum(pd_field)
+    name_field = f"{surname}<<{given}<{patron}"
+    # удаляем все не A–Z и пробелы, заменяем на '<'
+    name_field = ''.join(ch if 'A' <= ch <= 'Z' else '<' for ch in name_field)
 
-    birth = data['dob']
-    birth_check = mrz_checksum(birth)
+    # 2.2) первая строка: P< + страна + имя, до 44 символов
+    issuing = "RUS"  # код страны-эмитента
+    line1 = f"P<{issuing}{name_field}"
+    line1 = line1.ljust(44, '<')
 
-    expiry = data['expiry']
-    expiry_check = mrz_checksum(expiry)
+    # 2.3) вторая строка: поля с чек-цифрами
+    # паспорт: серия (3) + номер (6) = 9
+    ser3 = data['series'][:3]
+    num6 = data['number']
+    doc_num = ser3 + num6
+    c1 = mrz_checksum(doc_num)
 
-    opt_data = f"{last_digit}{data['issue']}{data['division_code']}".ljust(14, '<')
-    opt_check = mrz_checksum(opt_data)
+    # дата рождения и чек
+    bdate = data['dob']
+    c2 = mrz_checksum(bdate)
 
-    line2 = f"{pd_field}{pd_check}{data['nationality']}{birth}{birth_check}{data['gender']}{expiry}{expiry_check}{opt_data}{opt_check}"
-    line2 = line2[:43].ljust(44, '<')  # 44-й символ – можно добавить финальную контрольную цифру
+    # срок действия и чек
+    exp = data['expiry']
+    c3 = mrz_checksum(exp)
+
+    # персональные данные: 4-я цифра серии + дата выдачи + код подразделения
+    last_ser = data['series'][3]
+    div = data['division_code'].replace('-', '')
+    pers = f"{last_ser}{data['issue']}{div}"
+    pers = pers.ljust(14, '<')
+    c4 = mrz_checksum(pers)
+
+    # итоговая чек-цифра: по всем вышеперечисленным полям с их чек-цифрами
+    concat = doc_num + c1 + bdate + c2 + data['gender'] + exp + c3 + pers + c4
+    c5 = mrz_checksum(concat)
+
+    # собираем вторую строку и заполняем до 44
+    line2 = f"{doc_num}{c1}{data['nationality']}{bdate}{c2}{data['gender']}{exp}{c3}{pers}{c4}{c5}"
+    line2 = line2.ljust(44, '<')
+
     return line1, line2
+
 
 
 def insert_photo_noise(canvas: Image.Image, box):
@@ -382,13 +493,20 @@ class PassportGenerator:
                 "division_code": division_code
             }
         }
-        return fname, annotation
+        passport_bbox = [dx, dy, dx + img.width, dy + img.height]
+        return fname, annotation, annots, passport_bbox
 
 
 # ----------------------------- MAIN ----------------------------------
 def main():
-    OUT_IMG_DIR.mkdir(exist_ok=True, parents=True)
-    OUT_DIR.mkdir(exist_ok=True, parents=True)
+    # 1) Подготовка каталогов
+    OUT_IMG_DIR.mkdir(parents=True, exist_ok=True)
+    OUT_DIR.mkdir(parents=True, exist_ok=True)
+    for d in (ST1_IMG_T, ST1_IMG_V, ST1_LBL_T, ST1_LBL_V,
+              ST2_IMG_T, ST2_IMG_V, ST2_LBL_T, ST2_LBL_V):
+        d.mkdir(parents=True, exist_ok=True)
+
+    # 2) Инициализация генератора
     gen = PassportGenerator()
     ds = []
     coco_data = {
@@ -417,55 +535,87 @@ def main():
         ]
     }
 
-    photo_box = (50, 100, 170, 270)  # Задаём координаты фото
+    # 3) Генерация
     for i in range(N_PASSPORTS):
-        # С вероятностью 50% генерируем с MRZ или без
         include_mrz = random.choice([True, False])
-        fn, ann = gen.generate_one(i, offset=None, photo_box=COORDS["photo_box"], include_mrz=include_mrz, debug=DEBUG)
-        # Оригинальные размеры изображения
-        img = Image.open(OUT_IMG_DIR / fn)
-        width, height = img.size
+        fn, ann, annots, pbbox = gen.generate_one(
+            i,
+            offset=None,
+            photo_box=COORDS["photo_box"],
+            include_mrz=include_mrz,
+            debug=DEBUG
+        )
 
-        # Сохраняем обычную аннотацию для каждого изображения
+        img = Image.open(OUT_IMG_DIR / fn)
+        W, H = img.size
+        is_train = random.random() < 0.8
+
+        # a) Сохраняем оригинальные JSON-аннотации
         ds.append({
             "image_id": fn,
-            "mrz": ann['mrz'],
-            "photo": ann['photo'],
-            "text": ann['text']
+            "mrz": ann["mrz"],
+            "photo": ann["photo"],
+            "text": ann["text"]
         })
-
         coco_data["images"].append({
-            "id": i + 1,
+            "id": i+1,
             "file_name": fn,
-            "width": width,
-            "height": height
+            "width": W,
+            "height": H
         })
-
-        # Только если MRZ есть, добавляем в COCO
-        if ann['mrz']['exists']:
+        if ann["mrz"]["exists"]:
             coco_data["annotations"].append({
-                "id": i + 1,
-                "image_id": i + 1,
+                "id": i+1,
+                "image_id": i+1,
                 "category_id": 1,
-                "bbox": ann['mrz']['coordinates'],
-                "area": (ann['mrz']['coordinates'][2] - ann['mrz']['coordinates'][0]) *
-                        (ann['mrz']['coordinates'][3] - ann['mrz']['coordinates'][1]),
+                "bbox": ann["mrz"]["coordinates"],
+                "area": (ann["mrz"]["coordinates"][2] - ann["mrz"]["coordinates"][0]) *
+                        (ann["mrz"]["coordinates"][3] - ann["mrz"]["coordinates"][1]),
                 "iscrowd": 0,
                 "segmentation": []
             })
 
-    # Сохранение обычных аннотаций
+        # b) Stage1 YOLO: полный паспорт
+        scan_dir = ST1_IMG_T if is_train else ST1_IMG_V
+        lbl_dir  = ST1_LBL_T if is_train else ST1_LBL_V
+        shutil.copy(OUT_IMG_DIR / fn, scan_dir / fn)
+        save_yolo_txt(
+            lbl_dir / f"{fn[:-4]}.txt",
+            [(0, tuple(pbbox))],
+            (W, H)
+        )
+
+        # c) Stage2 YOLO: поля внутри паспорта
+        x1, y1, x2, y2 = pbbox
+        crop = img.crop((x1, y1, x2, y2))
+        pw, ph = crop.size
+        crop_dir = ST2_IMG_T if is_train else ST2_IMG_V
+        crop_lbl = ST2_LBL_T if is_train else ST2_LBL_V
+        crop_fn  = f"passport_{i:06d}.png"
+        crop.save(crop_dir / crop_fn)
+
+        items = []
+        for a in annots:
+            cls = FIELD_CLASSES[a["label"]]
+            fx1, fy1, fx2, fy2 = a["bbox"]
+            rx1, ry1 = fx1 - x1, fy1 - y1
+            rx2, ry2 = fx2 - x1, fy2 - y1
+            items.append((cls, (rx1, ry1, rx2, ry2)))
+        save_yolo_txt(
+            crop_lbl / f"{crop_fn[:-4]}.txt",
+            items,
+            (pw, ph)
+        )
+
+    # 4) Сохранение JSON
     with open(ANNOT_PATH, 'w', encoding='utf-8') as f:
         json.dump(ds, f, ensure_ascii=False, indent=2)
-
-    # Сохранение COCO аннотаций
     with open(COCO_ANNOT_PATH, 'w', encoding='utf-8') as f:
         json.dump(coco_data, f, ensure_ascii=False, indent=2)
 
     print(f"✅ {N_PASSPORTS} passports -> {OUT_IMG_DIR}")
     print(f"✅ COCO annotations saved to {COCO_ANNOT_PATH}")
-    print(f"✅ Regular annotations saved to {ANNOT_PATH}")
-
+    print(f"✅ YOLO datasets ready under {YOLO_ROOT}")
 
 if __name__ == '__main__':
     main()
