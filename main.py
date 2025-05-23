@@ -6,7 +6,7 @@ if not (GENERATE_STAGE1 or GENERATE_STAGE2):
     raise RuntimeError("Оба стейджа выключены – генерировать нечего.")
 
 # ─────────── БАЗОВЫЕ ПАРАМЕТРЫ (можно менять) ───────────
-TOTAL       = 100        # объём датасета
+TOTAL       = 1000        # объём датасета
 TRAIN_RATIO = 0.8
 BASE_SEED   = 42
 N_PROC      = __import__('os').cpu_count()   # процессов = ядер CPU
@@ -26,6 +26,8 @@ SERIES_FONT_SIZE   = 20
 FONT_SIZE          = 18
 GROUP_GAP          = 25
 DEBUG              = False
+BBOX_COLOR         = (0, 255, 0)   # зелёный для debug-bbox
+BBOX_WIDTH         = 2
 # ───────────────────────────────────────────
 
 # ────────── ПУТИ И ДИРЕКТОРИИ ──────────
@@ -48,6 +50,11 @@ ST2_IMG_T = YOLO_ROOT / "stage2" / "images" / "train"
 ST2_IMG_V = YOLO_ROOT / "stage2" / "images" / "val"
 ST2_LBL_T = YOLO_ROOT / "stage2" / "labels" / "train"
 ST2_LBL_V = YOLO_ROOT / "stage2" / "labels" / "val"
+
+if DEBUG:
+    DBG1_DIR = ROOT / "debug/stage1"
+    DBG2_DIR = ROOT / "debug/stage2"
+    for d in (DBG1_DIR, DBG2_DIR): d.mkdir(parents=True, exist_ok=True)
 
 # создаём только нужные каталоги
 OUT_IMG_DIR.mkdir(parents=True, exist_ok=True)
@@ -337,56 +344,79 @@ def worker_init():
     global GEN
     GEN = PassportGenerator()
 
-def worker(chunk_start,chunk_len,train_cut):
-    rng=random.Random(BASE_SEED+chunk_start)
-    out=[]
-    for idx in range(chunk_start,chunk_start+chunk_len):
+def worker(chunk_start, chunk_len, train_cut):
+    rng = random.Random(BASE_SEED + chunk_start)
+    res = []
+    for idx in range(chunk_start, chunk_start + chunk_len):
         is_train = idx < train_cut
-        fn,ann,pbbox = GEN.generate_one(idx,include_mrz=rng.choice([True,False]),rng=rng)
-        out.append((fn,is_train,ann,pbbox))
-    return out
-def _worker_wrapper(args): return worker(*args)
+        fn, ann, pbbox = GEN.generate_one(
+            idx, include_mrz=rng.choice([True, False]), rng=rng
+        )
+        res.append((fn, is_train, ann, pbbox))
+    return res
+
+def _wrap(args): return worker(*args)
 
 # ────────── MAIN ──────────
 def main():
-    chunk = max(1, math.ceil(TOTAL / (N_PROC * 4)))  # ~= 4-кратное покрытие пула
-    train_cut = math.floor(TOTAL*TRAIN_RATIO)
-    tasks=[(start,min(chunk,TOTAL-start),train_cut) for start in range(0,TOTAL,chunk)]
+    chunk = max(1, math.ceil(TOTAL / (N_PROC * 4)))
+    train_cut = math.floor(TOTAL * TRAIN_RATIO)
+    tasks = [(start, min(chunk, TOTAL - start), train_cut)
+             for start in range(0, TOTAL, chunk)]
 
-    with mp.Pool(processes=N_PROC,initializer=worker_init) as pool:
-        for batch in pool.imap_unordered(_worker_wrapper,tasks,chunksize=1):
-            for fn,is_train,annots,pbbox in batch:
-                img_path=OUT_IMG_DIR/fn
-                img=Image.open(img_path); W,H=img.size
+    with mp.Pool(processes=N_PROC, initializer=worker_init) as pool:
+        for batch in pool.imap_unordered(_wrap, tasks, chunksize=1):
+            for fn, is_train, ann, pbbox in batch:
+                img_path = OUT_IMG_DIR / fn
+                img = Image.open(img_path)
+                W, H = img.size
 
-                # Stage-1
+                # ---------- stage-1 ----------
                 if GENERATE_STAGE1:
-                    img_dir = ST1_IMG_T if is_train else ST1_IMG_V
-                    lbl_dir = ST1_LBL_T if is_train else ST1_LBL_V
-                    shutil.move(img_path,img_dir/fn)
-                    save_yolo_txt(lbl_dir/f"{fn[:-4]}.txt",[(0,tuple(pbbox))],(W,H))
+                    dst_img = ST1_IMG_T if is_train else ST1_IMG_V
+                    dst_lbl = ST1_LBL_T if is_train else ST1_LBL_V
+                    shutil.move(img_path, dst_img / fn)
+                    save_yolo_txt(dst_lbl / f"{fn[:-4]}.txt",
+                                  [(0, tuple(pbbox))], (W, H))
 
-                # Stage-2
+                    if DEBUG:
+                        dbg = img.copy()
+                        draw = ImageDraw.Draw(dbg)
+                        draw.rectangle(pbbox, outline=BBOX_COLOR, width=BBOX_WIDTH)
+                        dbg.save(DBG1_DIR / fn)
+
+                # ---------- stage-2 ----------
                 if GENERATE_STAGE2:
-                    img_dir = ST2_IMG_T if is_train else ST2_IMG_V
-                    lbl_dir = ST2_LBL_T if is_train else ST2_LBL_V
-                    x1,y1,x2,y2 = pbbox
-                    crop = img.crop((x1,y1,x2,y2))
-                    crop.save(img_dir/fn)
-                    items=[(FIELD_CLASSES[a["label"]], (a["bbox"][0]-x1,a["bbox"][1]-y1,
-                                                        a["bbox"][2]-x1,a["bbox"][3]-y1))
-                           for a in annots]
-                    save_yolo_txt(lbl_dir/f"{fn[:-4]}.txt",items,crop.size)
+                    dst_img = ST2_IMG_T if is_train else ST2_IMG_V
+                    dst_lbl = ST2_LBL_T if is_train else ST2_LBL_V
+                    x1, y1, x2, y2 = pbbox
+                    crop = img.crop((x1, y1, x2, y2))
+                    crop.save(dst_img / fn)
 
+                    items = []
+                    for a in ann:
+                        cls = FIELD_CLASSES[a["label"]]
+                        fx1, fy1, fx2, fy2 = a["bbox"]
+                        items.append((cls, (fx1 - x1, fy1 - y1, fx2 - x1, fy2 - y1)))
+                    save_yolo_txt(dst_lbl / f"{fn[:-4]}.txt", items, crop.size)
+
+                    if DEBUG:
+                        dbg = crop.copy()
+                        draw = ImageDraw.Draw(dbg)
+                        for _, (bx1, by1, bx2, by2) in items:
+                            draw.rectangle([bx1, by1, bx2, by2],
+                                           outline=BBOX_COLOR, width=BBOX_WIDTH)
+                        dbg.save(DBG2_DIR / fn)
+
+                # если stage-1 выключен — удаляем исходный скан
                 if (not GENERATE_STAGE1) and img_path.exists():
                     img_path.unlink()
 
     print("✅ Датасет готов!")
-    if GENERATE_STAGE1:
-        print(f"   stage-1 → {ST1_IMG_T.parent}")
-    if GENERATE_STAGE2:
-        print(f"   stage-2 → {ST2_IMG_T.parent}")
+    if GENERATE_STAGE1: print(f"   stage-1 → {ST1_IMG_T.parent}")
+    if GENERATE_STAGE2: print(f"   stage-2 → {ST2_IMG_T.parent}")
+    if DEBUG:           print(f"   debug   → {DBG1_DIR.parent}")
 
-# ────────── ENTRY ──────────
-if __name__=="__main__":
+# ────────── entry ──────────
+if __name__ == "__main__":
     main()
